@@ -8,12 +8,16 @@ import argparse
 from datasets import load_dataset
 import torch
 from sentence_transformers import CrossEncoder
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from openai_ranker import OpenAIReranker
 from retrievers import calculate_retrieval_metrics
+from together_ranker import TogetherListwiseReranker
+
 import functools
 import logging
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
-                    datefmt='%m/%d/%Y %H:%M:%S')
+                    datefmt='%m/%d/%Y %H:%M:%S', level=logging.INFO)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
@@ -197,18 +201,52 @@ class STReranker:
         return ranking
 
 
+def rerank_single_query(qid, scores, model, documents, examples, args):
+    logger.debug(f"Reranking qid: {qid}")
+    try:
+        sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:args.input_k]
+        
+        if isinstance(model, TogetherListwiseReranker):
+            # Together ranker expects List[Tuple[str, str]]
+            docs_for_rerank = [(did, documents[did]) for did, _ in sorted_scores]
+        elif isinstance(model, (ClaudeModel, OpenAIModel)):
+            # Other models might expect List[List[str, str]] - adjust if needed
+            docs_for_rerank = [[did, documents[did]] for did, _ in sorted_scores]
+        else:
+            # Default or handle other model types if necessary
+            docs_for_rerank = [(did, documents[did]) for did, _ in sorted_scores]
+
+        reranked_ids = model.rerank(docs=docs_for_rerank, query=examples[qid]['query'], topk=args.k)
+        
+        # Assign descending scores based on the new order
+        final_scores = {doc_id: args.k - i for i, doc_id in enumerate(reranked_ids)}
+        logger.debug(f"Finished reranking qid: {qid}")
+        return qid, final_scores
+    except Exception as e:
+        logger.error(f"Error reranking qid {qid}: {e}", exc_info=True)
+        # Return qid and empty scores on error to avoid blocking others
+        return qid, {}
+
+
 if __name__=='__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--task', type=str, required=True,
                         choices=['biology','earth_science','economics','pony','psychology','robotics','theoremqa_questions', "theoremqa_theorems",
                                  'stackoverflow','sustainable_living','aops','leetcode'])
     parser.add_argument('--long_context', action='store_true')
-    parser.add_argument('--llm', type=str, default=None)
+    parser.add_argument('--llm', type=str, default=None, help="Model name for Claude, OpenAI, or Sentence Transformer rerankers (e.g., 'claude-3-opus-20240229', 'gpt-4-turbo', 'mixedbread-ai/mxbai-rerank-xsmall-v1')")
+    parser.add_argument('--together_model', type=str, default=None, help="Model name for TogetherListwiseReranker (e.g., 'mistralai/Mixtral-8x7B-Instruct-v0.1')")
+    parser.add_argument('--openai', action="store_true")
+    parser.add_argument('--window_size', type=int, default=10, help="Window size for TogetherListwiseReranker sliding window.")
+    parser.add_argument('--stride', type=int, default=5, help="Stride for TogetherListwiseReranker sliding window.")
     parser.add_argument('--score_file', type=str, default=None)
     parser.add_argument('--rerank_score_file', type=str, default=None)
     parser.add_argument('--input_k', type=int)
     parser.add_argument('--k', type=int)
+    parser.add_argument('--together_api', action="store_true")
+    parser.add_argument("--workers", type=int, default=6)
     args = parser.parse_args()
+    print(f"Running reranking for {args.task=}")
 
     if os.path.exists(args.rerank_score_file):
         print(f"Rerank score file {args.rerank_score_file} already exists.")
@@ -229,38 +267,66 @@ if __name__=='__main__':
         all_scores = json.load(f)
     new_scores = copy.deepcopy(all_scores)
 
-    if 'claude' in args.llm:
-        model = ClaudeModel(version=args.llm)
-    elif "gpt" in args.llm:
-        model = OpenAIModel(model_name=args.llm)
-    else:
-        model = STReranker(model_name=args.llm)
-
-    for qid,scores in tqdm(all_scores.items()):
-        docs = []
-        sorted_scores = sorted(scores.items(),key=lambda x:x[1],reverse=True)[:args.input_k]
-        for did, _ in sorted_scores:
-            docs.append([did, documents[did]])
-
-        if 'claude' in args.llm or "gpt" in args.llm:
-            new_rank = model.rerank(docs=docs, query=examples[qid]['query'], topk=args.k)
-            cur_score = {}
-            if new_rank is None:
-                # use the original ranks if fail
-                for rank_id, (did, _) in enumerate(sorted_scores):
-                    cur_score[did] = args.k - rank_id
-            else:
-                for rank_id, r in enumerate(new_rank):
-                    cur_score[r] = args.k - rank_id
-            new_scores[qid] = cur_score
+    model = None
+    if args.together_model:
+        logger.info(f"Using TogetherListwiseReranker with model: {args.together_model}")
+        if args.openai:
+            try:
+                model = OpenAIReranker(model_name=args.together_model, 
+                                       task=args.task,
+                                       window_size=args.window_size, 
+                                       stride=args.stride, 
+                                       api_key=os.getenv("OPENAI_API_KEY"),
+                                       base_url=None,
+                                       together_api=args.together_api
+                                    )
+            except ValueError as e:
+                logger.error(f"Error initializing OpenAIReranker: {e}")
+                exit(1)
         else:
-            ctxs = [{'id': did, 'text': documents[did]} for did, _ in sorted_scores]
-            cur_score = model.rerank(query=examples[qid]['query'], docs=ctxs, topk=args.k)
-            new_scores[qid] = cur_score
+            try:
+                model = TogetherListwiseReranker(model_name=args.together_model, 
+                                                task=args.task,
+                                                window_size=args.window_size, 
+                                                stride=args.stride, 
+                                                together_api=args.together_api
+                                                )
+            except ValueError as e:
+                logger.error(f"Error initializing TogetherListwiseReranker: {e}")
+                exit(1)
+    elif args.llm:
+        if 'claude' in args.llm:
+            logger.info(f"Using ClaudeModel with version: {args.llm}")
+            model = ClaudeModel(version=args.llm)
+        elif "gpt" in args.llm:
+            logger.info(f"Using OpenAIModel with model name: {args.llm}")
+            model = OpenAIModel(model_name=args.llm)
+        else:
+            logger.info(f"Using STReranker with model name: {args.llm}")
+            model = STReranker(model_name=args.llm)
+    else:
+        logger.error("No reranker specified. Please provide --llm or --together_model.")
+        exit(1)
+
+    reranked_scores = {}
+    futures = []
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        logger.info(f"Submitting {len(all_scores)} queries for parallel reranking...")
+        for qid, scores in all_scores.items():
+            futures.append(executor.submit(rerank_single_query, qid, scores, model, documents, examples, args))
+        
+        logger.info(f"Waiting for reranking tasks to complete...")
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Reranking Queries"):
+            try:
+                qid_result, final_scores_result = future.result()
+                if final_scores_result: 
+                    reranked_scores[qid_result] = final_scores_result
+            except Exception as e:
+                logger.error(f"Error retrieving result from future: {e}", exc_info=True)
 
     os.makedirs(os.path.dirname(args.rerank_score_file), exist_ok=True)
     with open(args.rerank_score_file, 'w') as f:
-        json.dump(new_scores, f, indent=2)
+        json.dump(reranked_scores, f, indent=2)
 
     if args.long_context:
         key = 'gold_ids_long'
@@ -275,6 +341,6 @@ if __name__=='__main__':
             if i in documents:
                 ground_truth[e['id']][i] = 0
 
-    results = calculate_retrieval_metrics(results=new_scores, qrels=ground_truth)
+    results = calculate_retrieval_metrics(results=reranked_scores, qrels=ground_truth)
     with open(args.rerank_score_file.replace(".json", "_results.json"), 'w') as f:
         json.dump(results, f, indent=2)
